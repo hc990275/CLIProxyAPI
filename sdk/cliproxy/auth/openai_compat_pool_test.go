@@ -2,15 +2,18 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+const openAICompatPoolProviderKey = "openai-compatible-pool"
 
 type openAICompatPoolExecutor struct {
 	id string
@@ -19,9 +22,11 @@ type openAICompatPoolExecutor struct {
 	executeModels     []string
 	countModels       []string
 	streamModels      []string
+	executePayloads   map[string][]byte
 	executeErrors     map[string]error
 	countErrors       map[string]error
 	streamFirstErrors map[string]error
+	streamAttempts    map[string]bool
 	streamPayloads    map[string][]cliproxyexecutor.StreamChunk
 }
 
@@ -33,24 +38,31 @@ func (e *openAICompatPoolExecutor) Execute(ctx context.Context, auth *Auth, req 
 	_ = opts
 	e.mu.Lock()
 	e.executeModels = append(e.executeModels, req.Model)
+	payload := append([]byte(nil), e.executePayloads[req.Model]...)
 	err := e.executeErrors[req.Model]
 	e.mu.Unlock()
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	if len(payload) > 0 {
+		return cliproxyexecutor.Response{Payload: payload}, nil
+	}
 	return cliproxyexecutor.Response{Payload: []byte(req.Model)}, nil
 }
 
 func (e *openAICompatPoolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	_ = ctx
 	_ = auth
 	_ = opts
 	e.mu.Lock()
 	e.streamModels = append(e.streamModels, req.Model)
 	err := e.streamFirstErrors[req.Model]
+	attempted := e.streamAttempts[req.Model]
 	payloadChunks, hasCustomChunks := e.streamPayloads[req.Model]
 	chunks := append([]cliproxyexecutor.StreamChunk(nil), payloadChunks...)
 	e.mu.Unlock()
+	if attempted {
+		cliproxyexecutor.MarkUpstreamAttempt(ctx)
+	}
 	ch := make(chan cliproxyexecutor.StreamChunk, max(1, len(chunks)))
 	if err != nil {
 		ch <- cliproxyexecutor.StreamChunk{Err: err}
@@ -169,18 +181,18 @@ func newOpenAICompatPoolTestManager(t *testing.T, alias string, models []interna
 	m := NewManager(nil, nil, nil)
 	m.SetConfig(cfg)
 	if executor == nil {
-		executor = &openAICompatPoolExecutor{id: "pool"}
+		executor = &openAICompatPoolExecutor{id: openAICompatPoolProviderKey}
 	}
 	m.RegisterExecutor(executor)
 
 	auth := &Auth{
 		ID:       "pool-auth-" + t.Name(),
-		Provider: "pool",
+		Provider: openAICompatPoolProviderKey,
 		Status:   StatusActive,
 		Attributes: map[string]string{
 			"api_key":      "test-key",
 			"compat_name":  "pool",
-			"provider_key": "pool",
+			"provider_key": openAICompatPoolProviderKey,
 		},
 	}
 	if _, err := m.Register(context.Background(), auth); err != nil {
@@ -188,7 +200,7 @@ func newOpenAICompatPoolTestManager(t *testing.T, alias string, models []interna
 	}
 
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth.ID, "pool", []*registry.ModelInfo{{ID: alias}})
+	reg.RegisterClient(auth.ID, openAICompatPoolProviderKey, []*registry.ModelInfo{{ID: alias}})
 	t.Cleanup(func() {
 		reg.UnregisterClient(auth.ID)
 	})
@@ -214,31 +226,31 @@ func TestManagerExecuteCount_OpenAICompatAliasPoolStopsOnInvalidRequest(t *testi
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusUnprocessableEntity, Message: "unprocessable entity"}
 	executor := &openAICompatPoolExecutor{
-		id:          "pool",
-		countErrors: map[string]error{"qwen3.5-plus": invalidErr},
+		id:          openAICompatPoolProviderKey,
+		countErrors: map[string]error{"deepseek-v3.1": invalidErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	_, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	_, err := m.ExecuteCount(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err == nil || err.Error() != invalidErr.Error() {
 		t.Fatalf("execute count error = %v, want %v", err, invalidErr)
 	}
 	got := executor.CountModels()
-	if len(got) != 1 || got[0] != "qwen3.5-plus" {
+	if len(got) != 1 || got[0] != "deepseek-v3.1" {
 		t.Fatalf("count calls = %v, want only first invalid model", got)
 	}
 }
 func TestResolveModelAliasPoolFromConfigModels(t *testing.T) {
 	models := []modelAliasEntry{
-		internalconfig.OpenAICompatibilityModel{Name: "qwen3.5-plus", Alias: "claude-opus-4.66"},
+		internalconfig.OpenAICompatibilityModel{Name: "deepseek-v3.1", Alias: "claude-opus-4.66"},
 		internalconfig.OpenAICompatibilityModel{Name: "glm-5", Alias: "claude-opus-4.66"},
 		internalconfig.OpenAICompatibilityModel{Name: "kimi-k2.5", Alias: "claude-opus-4.66"},
 	}
 	got := resolveModelAliasPoolFromConfigModels("claude-opus-4.66(8192)", models)
-	want := []string{"qwen3.5-plus(8192)", "glm-5(8192)", "kimi-k2.5(8192)"}
+	want := []string{"deepseek-v3.1(8192)", "glm-5(8192)", "kimi-k2.5(8192)"}
 	if len(got) != len(want) {
 		t.Fatalf("pool len = %d, want %d (%v)", len(got), len(want), got)
 	}
@@ -249,16 +261,31 @@ func TestResolveModelAliasPoolFromConfigModels(t *testing.T) {
 	}
 }
 
+func TestResolveModelAliasPoolPrefersExactSuffixedAlias(t *testing.T) {
+	models := []modelAliasEntry{
+		internalconfig.OpenAICompatibilityModel{Name: "base-model", Alias: "public"},
+		internalconfig.OpenAICompatibilityModel{Name: "low-model", Alias: "public(low)", ForceMapping: true},
+	}
+	got := resolveModelAliasPoolFromConfigModels("public(low)", models)
+	if len(got) != 1 || got[0] != "low-model(low)" {
+		t.Fatalf("exact suffixed pool = %v, want [low-model(low)]", got)
+	}
+	result := resolveModelAliasResultFromConfigModels("public(low)", models)
+	if result.UpstreamModel != "low-model(low)" || !result.ForceMapping {
+		t.Fatalf("exact suffixed alias result = %+v, want low-model(low) with force mapping", result)
+	}
+}
+
 func TestManagerExecute_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T) {
 	alias := "claude-opus-4.66"
-	executor := &openAICompatPoolExecutor{id: "pool"}
+	executor := &openAICompatPoolExecutor{id: openAICompatPoolProviderKey}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
 	for i := 0; i < 3; i++ {
-		resp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 		if err != nil {
 			t.Fatalf("execute %d: %v", i, err)
 		}
@@ -268,7 +295,7 @@ func TestManagerExecute_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T) {
 	}
 
 	got := executor.ExecuteModels()
-	want := []string{"qwen3.5-plus", "glm-5", "qwen3.5-plus"}
+	want := []string{"deepseek-v3.1", "glm-5", "deepseek-v3.1"}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -279,24 +306,62 @@ func TestManagerExecute_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T) {
 	}
 }
 
+func TestManagerExecute_OpenAICompatAliasPoolForceMappingRotatesAndRewritesResponse(t *testing.T) {
+	alias := "claude-opus-4.66"
+	executor := &openAICompatPoolExecutor{
+		id: openAICompatPoolProviderKey,
+		executePayloads: map[string][]byte{
+			"deepseek-v3.1": []byte(`{"model":"deepseek-v3.1"}`),
+			"glm-5":         []byte(`{"model":"glm-5"}`),
+		},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "deepseek-v3.1", Alias: alias, ForceMapping: true},
+		{Name: "glm-5", Alias: alias, ForceMapping: true},
+	}, executor)
+
+	var payloads []string
+	for i := 0; i < 2; i++ {
+		resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("execute %d: %v", i, err)
+		}
+		payloads = append(payloads, string(resp.Payload))
+	}
+
+	got := executor.ExecuteModels()
+	wantModels := []string{"deepseek-v3.1", "glm-5"}
+	for i := range wantModels {
+		if got[i] != wantModels[i] {
+			t.Fatalf("execute call %d model = %q, want %q", i, got[i], wantModels[i])
+		}
+	}
+	wantPayloads := []string{`{"model":"claude-opus-4.66"}`, `{"model":"claude-opus-4.66"}`}
+	for i := range wantPayloads {
+		if payloads[i] != wantPayloads[i] {
+			t.Fatalf("payload %d = %s, want %s", i, payloads[i], wantPayloads[i])
+		}
+	}
+}
+
 func TestManagerExecute_OpenAICompatAliasPoolStopsOnBadRequest(t *testing.T) {
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}
 	executor := &openAICompatPoolExecutor{
-		id:            "pool",
-		executeErrors: map[string]error{"qwen3.5-plus": invalidErr},
+		id:            openAICompatPoolProviderKey,
+		executeErrors: map[string]error{"deepseek-v3.1": invalidErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	_, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	_, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err == nil || err.Error() != invalidErr.Error() {
 		t.Fatalf("execute error = %v, want %v", err, invalidErr)
 	}
 	got := executor.ExecuteModels()
-	if len(got) != 1 || got[0] != "qwen3.5-plus" {
+	if len(got) != 1 || got[0] != "deepseek-v3.1" {
 		t.Fatalf("execute calls = %v, want only first invalid model", got)
 	}
 }
@@ -308,15 +373,15 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportBadRequest(t
 		Message:    "invalid_request_error: The requested model is not supported.",
 	}
 	executor := &openAICompatPoolExecutor{
-		id:            "pool",
-		executeErrors: map[string]error{"qwen3.5-plus": modelSupportErr},
+		id:            openAICompatPoolProviderKey,
+		executeErrors: map[string]error{"deepseek-v3.1": modelSupportErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	resp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("execute error = %v, want fallback success", err)
 	}
@@ -324,7 +389,7 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportBadRequest(t
 		t.Fatalf("payload = %q, want %q", string(resp.Payload), "glm-5")
 	}
 	got := executor.ExecuteModels()
-	want := []string{"qwen3.5-plus", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5"}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -338,7 +403,7 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportBadRequest(t
 	if !ok || updated == nil {
 		t.Fatalf("expected auth to remain registered")
 	}
-	state := updated.ModelStates["qwen3.5-plus"]
+	state := updated.ModelStates["deepseek-v3.1"]
 	if state == nil {
 		t.Fatalf("expected suspended upstream model state")
 	}
@@ -354,15 +419,15 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportUnprocessabl
 		Message:    "The requested model is not supported.",
 	}
 	executor := &openAICompatPoolExecutor{
-		id:            "pool",
-		executeErrors: map[string]error{"qwen3.5-plus": modelSupportErr},
+		id:            openAICompatPoolProviderKey,
+		executeErrors: map[string]error{"deepseek-v3.1": modelSupportErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	resp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("execute error = %v, want fallback success", err)
 	}
@@ -370,7 +435,7 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportUnprocessabl
 		t.Fatalf("payload = %q, want %q", string(resp.Payload), "glm-5")
 	}
 	got := executor.ExecuteModels()
-	want := []string{"qwen3.5-plus", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5"}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -384,15 +449,15 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportUnprocessabl
 func TestManagerExecute_OpenAICompatAliasPoolFallsBackWithinSameAuth(t *testing.T) {
 	alias := "claude-opus-4.66"
 	executor := &openAICompatPoolExecutor{
-		id:            "pool",
-		executeErrors: map[string]error{"qwen3.5-plus": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}},
+		id:            openAICompatPoolProviderKey,
+		executeErrors: map[string]error{"deepseek-v3.1": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	resp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -400,7 +465,7 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackWithinSameAuth(t *testing.
 		t.Fatalf("payload = %q, want %q", string(resp.Payload), "glm-5")
 	}
 	got := executor.ExecuteModels()
-	want := []string{"qwen3.5-plus", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("execute call %d model = %q, want %q", i, got[i], want[i])
@@ -408,20 +473,41 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackWithinSameAuth(t *testing.
 	}
 }
 
+func TestManagerExecute_OpenAICompatAliasPoolUsesSelectedModelForceMapping(t *testing.T) {
+	alias := "public-model"
+	executor := &openAICompatPoolExecutor{
+		id:              openAICompatPoolProviderKey,
+		executeErrors:   map[string]error{"first-upstream": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}},
+		executePayloads: map[string][]byte{"second-upstream": []byte(`{"model":"second-upstream"}`)},
+	}
+	manager := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "first-upstream", Alias: alias, ForceMapping: true},
+		{Name: "second-upstream", Alias: alias},
+	}, executor)
+
+	response, errExecute := manager.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(response.Payload); got != `{"model":"second-upstream"}` {
+		t.Fatalf("payload = %s, want selected model without force mapping", got)
+	}
+}
+
 func TestManagerExecuteStream_OpenAICompatAliasPoolRetriesOnEmptyBootstrap(t *testing.T) {
 	alias := "claude-opus-4.66"
 	executor := &openAICompatPoolExecutor{
-		id: "pool",
+		id: openAICompatPoolProviderKey,
 		streamPayloads: map[string][]cliproxyexecutor.StreamChunk{
-			"qwen3.5-plus": {},
+			"deepseek-v3.1": {},
 		},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	streamResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	streamResult, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("execute stream: %v", err)
 	}
@@ -436,7 +522,7 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolRetriesOnEmptyBootstrap(t *te
 		t.Fatalf("payload = %q, want %q", string(payload), "glm-5")
 	}
 	got := executor.StreamModels()
-	want := []string{"qwen3.5-plus", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])
@@ -447,15 +533,15 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolRetriesOnEmptyBootstrap(t *te
 func TestManagerExecuteStream_OpenAICompatAliasPoolFallsBackBeforeFirstByte(t *testing.T) {
 	alias := "claude-opus-4.66"
 	executor := &openAICompatPoolExecutor{
-		id:                "pool",
-		streamFirstErrors: map[string]error{"qwen3.5-plus": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}},
+		id:                openAICompatPoolProviderKey,
+		streamFirstErrors: map[string]error{"deepseek-v3.1": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	streamResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	streamResult, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("execute stream: %v", err)
 	}
@@ -470,7 +556,7 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolFallsBackBeforeFirstByte(t *t
 		t.Fatalf("payload = %q, want %q", string(payload), "glm-5")
 	}
 	got := executor.StreamModels()
-	want := []string{"qwen3.5-plus", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])
@@ -485,20 +571,20 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidRequest(t *test
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusUnprocessableEntity, Message: "unprocessable entity"}
 	executor := &openAICompatPoolExecutor{
-		id:                "pool",
-		streamFirstErrors: map[string]error{"qwen3.5-plus": invalidErr},
+		id:                openAICompatPoolProviderKey,
+		streamFirstErrors: map[string]error{"deepseek-v3.1": invalidErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	_, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	_, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err == nil || err.Error() != invalidErr.Error() {
 		t.Fatalf("execute stream error = %v, want %v", err, invalidErr)
 	}
 	got := executor.StreamModels()
-	if len(got) != 1 || got[0] != "qwen3.5-plus" {
+	if len(got) != 1 || got[0] != "deepseek-v3.1" {
 		t.Fatalf("stream calls = %v, want only first invalid model", got)
 	}
 }
@@ -510,16 +596,16 @@ func TestManagerExecute_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterReques
 		Message:    "invalid_request_error: The requested model is not supported.",
 	}
 	executor := &openAICompatPoolExecutor{
-		id:            "pool",
-		executeErrors: map[string]error{"qwen3.5-plus": modelSupportErr},
+		id:            openAICompatPoolProviderKey,
+		executeErrors: map[string]error{"deepseek-v3.1": modelSupportErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
 	for i := 0; i < 3; i++ {
-		resp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 		if err != nil {
 			t.Fatalf("execute %d: %v", i, err)
 		}
@@ -529,7 +615,7 @@ func TestManagerExecute_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterReques
 	}
 
 	got := executor.ExecuteModels()
-	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5", "glm-5", "glm-5"}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -547,16 +633,16 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLater
 		Message:    "The requested model is not supported.",
 	}
 	executor := &openAICompatPoolExecutor{
-		id:                "pool",
-		streamFirstErrors: map[string]error{"qwen3.5-plus": modelSupportErr},
+		id:                openAICompatPoolProviderKey,
+		streamFirstErrors: map[string]error{"deepseek-v3.1": modelSupportErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
 	for i := 0; i < 3; i++ {
-		streamResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		streamResult, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 		if err != nil {
 			t.Fatalf("execute stream %d: %v", i, err)
 		}
@@ -569,7 +655,7 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLater
 	}
 
 	got := executor.StreamModels()
-	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5", "glm-5", "glm-5"}
 	if len(got) != len(want) {
 		t.Fatalf("stream calls = %v, want %v", got, want)
 	}
@@ -582,14 +668,14 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLater
 
 func TestManagerExecuteCount_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T) {
 	alias := "claude-opus-4.66"
-	executor := &openAICompatPoolExecutor{id: "pool"}
+	executor := &openAICompatPoolExecutor{id: openAICompatPoolProviderKey}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
 	for i := 0; i < 2; i++ {
-		resp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		resp, err := m.ExecuteCount(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 		if err != nil {
 			t.Fatalf("execute count %d: %v", i, err)
 		}
@@ -599,7 +685,7 @@ func TestManagerExecuteCount_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T
 	}
 
 	got := executor.CountModels()
-	want := []string{"qwen3.5-plus", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("count call %d model = %q, want %q", i, got[i], want[i])
@@ -614,16 +700,16 @@ func TestManagerExecuteCount_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterR
 		Message:    "invalid_request_error: The requested model is unsupported.",
 	}
 	executor := &openAICompatPoolExecutor{
-		id:          "pool",
-		countErrors: map[string]error{"qwen3.5-plus": modelSupportErr},
+		id:          openAICompatPoolProviderKey,
+		countErrors: map[string]error{"deepseek-v3.1": modelSupportErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
 	for i := 0; i < 3; i++ {
-		resp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		resp, err := m.ExecuteCount(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 		if err != nil {
 			t.Fatalf("execute count %d: %v", i, err)
 		}
@@ -633,7 +719,7 @@ func TestManagerExecuteCount_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterR
 	}
 
 	got := executor.CountModels()
-	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "glm-5"}
+	want := []string{"deepseek-v3.1", "glm-5", "glm-5", "glm-5"}
 	if len(got) != len(want) {
 		t.Fatalf("count calls = %v, want %v", got, want)
 	}
@@ -650,7 +736,7 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
 			Name: "pool",
 			Models: []internalconfig.OpenAICompatibilityModel{
-				{Name: "qwen3.5-plus", Alias: alias},
+				{Name: "deepseek-v3.1", Alias: alias},
 				{Name: "glm-5", Alias: alias},
 			},
 		}},
@@ -659,27 +745,27 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 	m.SetConfig(cfg)
 	m.SetRetryConfig(0, 0, 1)
 
-	executor := &authScopedOpenAICompatPoolExecutor{id: "pool"}
+	executor := &authScopedOpenAICompatPoolExecutor{id: openAICompatPoolProviderKey}
 	m.RegisterExecutor(executor)
 
 	badAuth := &Auth{
 		ID:       "aa-blocked-auth",
-		Provider: "pool",
+		Provider: openAICompatPoolProviderKey,
 		Status:   StatusActive,
 		Attributes: map[string]string{
 			"api_key":      "bad-key",
 			"compat_name":  "pool",
-			"provider_key": "pool",
+			"provider_key": openAICompatPoolProviderKey,
 		},
 	}
 	goodAuth := &Auth{
 		ID:       "bb-good-auth",
-		Provider: "pool",
+		Provider: openAICompatPoolProviderKey,
 		Status:   StatusActive,
 		Attributes: map[string]string{
 			"api_key":      "good-key",
 			"compat_name":  "pool",
-			"provider_key": "pool",
+			"provider_key": openAICompatPoolProviderKey,
 		},
 	}
 	if _, err := m.Register(context.Background(), badAuth); err != nil {
@@ -690,8 +776,8 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 	}
 
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(badAuth.ID, "pool", []*registry.ModelInfo{{ID: alias}})
-	reg.RegisterClient(goodAuth.ID, "pool", []*registry.ModelInfo{{ID: alias}})
+	reg.RegisterClient(badAuth.ID, openAICompatPoolProviderKey, []*registry.ModelInfo{{ID: alias}})
+	reg.RegisterClient(goodAuth.ID, openAICompatPoolProviderKey, []*registry.ModelInfo{{ID: alias}})
 	t.Cleanup(func() {
 		reg.UnregisterClient(badAuth.ID)
 		reg.UnregisterClient(goodAuth.ID)
@@ -701,17 +787,17 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 		HTTPStatus: http.StatusBadRequest,
 		Message:    "invalid_request_error: The requested model is not supported.",
 	}
-	for _, upstreamModel := range []string{"qwen3.5-plus", "glm-5"} {
+	for _, upstreamModel := range []string{"deepseek-v3.1", "glm-5"} {
 		m.MarkResult(context.Background(), Result{
 			AuthID:   badAuth.ID,
-			Provider: "pool",
+			Provider: openAICompatPoolProviderKey,
 			Model:    upstreamModel,
 			Success:  false,
 			Error:    modelSupportErr,
 		})
 	}
 
-	resp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("execute error = %v, want success via fallback auth", err)
 	}
@@ -732,15 +818,15 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidBootstrap(t *te
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}
 	executor := &openAICompatPoolExecutor{
-		id:                "pool",
-		streamFirstErrors: map[string]error{"qwen3.5-plus": invalidErr},
+		id:                openAICompatPoolProviderKey,
+		streamFirstErrors: map[string]error{"deepseek-v3.1": invalidErr},
 	}
 	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "deepseek-v3.1", Alias: alias},
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	streamResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	streamResult, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
 	if err == nil {
 		t.Fatal("expected invalid request error")
 	}
@@ -750,7 +836,40 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidBootstrap(t *te
 	if streamResult != nil {
 		t.Fatalf("streamResult = %#v, want nil on invalid bootstrap", streamResult)
 	}
-	if got := executor.StreamModels(); len(got) != 1 || got[0] != "qwen3.5-plus" {
+	if got := executor.StreamModels(); len(got) != 1 || got[0] != "deepseek-v3.1" {
 		t.Fatalf("stream calls = %v, want only first upstream model", got)
+	}
+}
+
+func TestManagerExecuteStream_OpenAICompatAliasPoolPreservesEarlierUpstreamError(t *testing.T) {
+	alias := "claude-opus-4.66"
+	upstreamErr := &Error{HTTPStatus: http.StatusBadGateway, Message: "first model upstream failed"}
+	internalErr := errors.New("second model failed before upstream")
+	executor := &openAICompatPoolExecutor{
+		id: openAICompatPoolProviderKey,
+		streamFirstErrors: map[string]error{
+			"deepseek-v3.1": upstreamErr,
+			"glm-5":         internalErr,
+		},
+		streamAttempts: map[string]bool{"deepseek-v3.1": true},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "deepseek-v3.1", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	result, errExecute := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if result == nil || errExecute != nil {
+		t.Fatalf("ExecuteStream() = (%#v, %v), want an error stream", result, errExecute)
+	}
+	chunk, ok := <-result.Chunks
+	if !ok || !errors.Is(chunk.Err, upstreamErr) {
+		t.Fatalf("stream error = %v, want earlier upstream error %v", chunk.Err, upstreamErr)
+	}
+	if errors.Is(chunk.Err, internalErr) {
+		t.Fatalf("stream error = %v, later internal error replaced upstream error", chunk.Err)
+	}
+	if hasUpstreamExecutionAttempt(chunk.Err) {
+		t.Fatalf("stream error leaked internal upstream-attempt marker: %T/%v", chunk.Err, chunk.Err)
 	}
 }
